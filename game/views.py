@@ -1,7 +1,17 @@
 from django.contrib.auth import authenticate, login
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
 import json
+import logging
+
+from django.contrib.auth.models import User
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import GameRoom
+
+logger = logging.getLogger(__name__)
 
 @csrf_exempt  # 必须加这个，否则前端 Axios 请求会报 403 Forbidden
 def login_api(request):
@@ -29,3 +39,108 @@ def login_api(request):
             return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
             
     return JsonResponse({'status': 'error', 'message': '仅支持 POST 请求'}, status=405)
+
+class RegisterView(APIView):
+    def post(self, request):
+        username = request.data.get('username')
+        password = request.data.get('password')
+        
+        if not username or not password:
+            return Response({'error': '用户名和密码不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if User.objects.filter(username=username).exists():
+            return Response({'error': '用户名已存在'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # 创建用户
+        user = User.objects.create_user(username=username, password=password)
+        return Response({'message': '注册成功'}, status=status.HTTP_201_CREATED)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def create_room_api(request):
+    """创建房间 API"""
+    try:
+        data = json.loads(request.body)
+        game_id = data.get('game', 'gomoku')
+        room_id = data.get('room_id')
+        username = data.get('username')  # 从前端获取用户名
+
+        if not room_id:
+            return JsonResponse({
+                'status': 'error',
+                'message': '房间 ID 不能为空'
+            }, status=400)
+
+        # 优先从请求中获取用户，其次从认证用户获取，最后从前端传来的用户名获取
+        user = None
+        if request.user and request.user.is_authenticated:
+            user = request.user
+        elif username:
+            try:
+                user = User.objects.get(username=username)
+            except User.DoesNotExist:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': f'用户 {username} 不存在'
+                }, status=400)
+        else:
+            return JsonResponse({
+                'status': 'error',
+                'message': '必须指定用户名'
+            }, status=400)
+
+        logger.info(f"创建房间: room_id={room_id}, game_id={game_id}, user={user}")
+
+        # 创建房间并设置创建者为黑方玩家
+        room, created = GameRoom.objects.get_or_create(
+            room_id=str(room_id),
+            defaults={
+                'game_type': game_id,
+                'creator': user,
+                'player_black': user,  # 创建者自动成为黑方
+                'is_active': True
+            }
+        )
+
+        player_count = 0
+        if room.player_black:
+            player_count += 1
+        if room.player_white:
+            player_count += 1
+
+        logger.info(f"房间创建成功: {room_id}, created={created}, 当前玩家数={player_count}")
+
+        return JsonResponse({
+            'status': 'success',
+            'created': created,
+            'message': '房间创建成功' if created else '房间已存在',
+            'room': {
+                'id': room.room_id,
+                'playerCount': player_count,
+                'game': game_id
+            }
+        })
+    except Exception as e:
+        logger.error(f"创建房间出错: {e}")
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=400)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def rooms_api(request):
+    all_rooms = GameRoom.objects.filter(is_active=True) # 不要过滤 count < 2
+    rooms_data = []
+    for room in all_rooms:
+        count = 0
+        if room.player_black: count += 1  # 检查数据库字段
+        if room.player_white: count += 1
+        rooms_data.append({
+            'id': room.room_id,
+            'playerCount': count, # 这里传给前端
+            'status': '等待中' if count < 2 else '游戏中'
+        })
+    return JsonResponse({'status': 'success', 'rooms': rooms_data})
