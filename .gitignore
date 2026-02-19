@@ -1,0 +1,16 @@
+# Python 编译文件
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+env/
+
+# 数据库 (通常不上传本地数据库文件)
+db.sqlite3
+
+# 敏感信息
+.env
+
+# 静态文件收集
+staticfiles/
