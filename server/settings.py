@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     
     # 自定义 App
     'game',
+    'board',               # <--- 留言板 App
     'rest_framework',      # 用于前后端分离的 API
     'corsheaders',         # 用于处理跨域
     'channels',            # WebSocket 核心
@@ -38,7 +39,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',           # 必须在最顶端
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',       # 保持一个即可
+    'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -90,7 +91,6 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # Internationalization
-# 设置为中文和北京时间，这样后台界面更易读
 LANGUAGE_CODE = 'zh-hans'
 TIME_ZONE = 'Asia/Shanghai'
 USE_I18N = True
@@ -110,6 +110,23 @@ CHANNEL_LAYERS = {
     },
 }
 
-# --- 跨域配置 ---
-CORS_ALLOW_ALL_ORIGINS = True  # 允许前端 5173 端口访问后端接口
-CORS_ALLOW_CREDENTIALS = True  # 允许携带 Cookie 进行身份验证
+# --- 核心修改：跨域与安全配置 ---
+
+# 1. CORS 配置：允许前端访问
+CORS_ALLOW_ALL_ORIGINS = True  # 开发环境下允许所有来源
+CORS_ALLOW_CREDENTIALS = True  # 允许携带 Cookie (用于登录状态)
+
+# 2. CSRF 信任来源配置 (解决你提到的 Origin checking failed 报错)
+# 必须包含协议 http:// 且不能有末尾斜杠
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:5173',    # Vue 默认开发端口
+    'http://127.0.0.1:5173',
+    'http://localhost:8000',    # Django 端口
+    'http://127.0.0.1:8000',
+]
+
+# 3. 允许的请求头（确保 CSRF Token 能通过）
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-csrftoken',
+]
