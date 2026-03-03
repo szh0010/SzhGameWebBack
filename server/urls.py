@@ -1,18 +1,22 @@
 from django.contrib import admin
-from django.urls import path
-from game.views import login_api, rooms_api, create_room_api  # 确保这里导入的是你最新的函数名
-from game.views import RegisterView  # 导入注册视图
+from django.urls import path, include  # 1. 确保这里导入了 include
+from game.views import login_api, rooms_api, create_room_api 
+from game.views import RegisterView 
+
 urlpatterns = [
     # 管理后台
     path('admin/', admin.site.urls),
 
-    # 登录接口
+    # --- Game 应用接口 ---
     path('api/login/', login_api),
-    # 注册接口
     path('api/register/', RegisterView.as_view()),
-    # 房间列表接口
     path('api/rooms/', rooms_api),
-    # 创建房间接口
     path('api/create-room/', create_room_api),
-]
 
+    # --- Board 应用接口 ---
+    # 2. 将 board 的所有路由挂载在 api/board/ 路径下
+    path('api/board/', include('board.urls')),
+
+    # 3. DRF 可视化界面的登录/登出（可选，方便在浏览器里直接点登录）
+    path('api-auth/', include('rest_framework.urls')),
+]
