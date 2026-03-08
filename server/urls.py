@@ -1,5 +1,7 @@
 from django.contrib import admin
-from django.urls import path, include  # 1. 确保这里导入了 include
+from django.urls import path, include
+from django.conf import settings  # 新增：导入设置
+from django.conf.urls.static import static  # 新增：导入静态文件处理函数
 from game.views import login_api, rooms_api, create_room_api 
 from game.views import RegisterView 
 
@@ -14,9 +16,12 @@ urlpatterns = [
     path('api/create-room/', create_room_api),
 
     # --- Board 应用接口 ---
-    # 2. 将 board 的所有路由挂载在 api/board/ 路径下
     path('api/board/', include('board.urls')),
 
-    # 3. DRF 可视化界面的登录/登出（可选，方便在浏览器里直接点登录）
+    # DRF 可视化界面的登录/登出
     path('api-auth/', include('rest_framework.urls')),
 ]
+
+# 核心修改：在开发环境下，开启媒体文件（图片）的访问路径
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
