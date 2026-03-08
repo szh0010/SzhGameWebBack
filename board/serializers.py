@@ -7,4 +7,5 @@ class StickyNoteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StickyNote
-        fields = ['id', 'title', 'content', 'user', 'created_at']
+        # 将 'image' 添加到字段列表中
+        fields = ['id', 'title', 'content', 'image', 'user', 'created_at']

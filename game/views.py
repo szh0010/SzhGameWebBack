@@ -1,6 +1,6 @@
 from django.contrib.auth import authenticate, login
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie # 1. 引入 ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 import json
 import logging
@@ -13,7 +13,9 @@ from .models import GameRoom
 
 logger = logging.getLogger(__name__)
 
-@csrf_exempt  # 必须加这个，否则前端 Axios 请求会报 403 Forbidden
+# 2. 添加 @ensure_csrf_cookie，强制响应包含 csrftoken 饼干
+@ensure_csrf_cookie
+@csrf_exempt  # 保留 exempt 是为了兼容你目前前端没带令牌的登录请求
 def login_api(request):
     if request.method == 'POST':
         try:
@@ -24,6 +26,8 @@ def login_api(request):
             user = authenticate(username=username, password=password)
             
             if user is not None:
+                # 这一步会创建 Session，由于加了 ensure_csrf_cookie，
+                # 浏览器会同时收到 sessionid 和 csrftoken 两个饼干。
                 login(request, user)
                 return JsonResponse({
                     'status': 'success', 
@@ -34,7 +38,7 @@ def login_api(request):
                 return JsonResponse({
                     'status': 'error', 
                     'message': '用户名或密码错误'
-                }, status=400)
+                })
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
             
@@ -64,7 +68,7 @@ def create_room_api(request):
         data = json.loads(request.body)
         game_id = data.get('game', 'gomoku')
         room_id = data.get('room_id')
-        username = data.get('username')  # 从前端获取用户名
+        username = data.get('username')
 
         if not room_id:
             return JsonResponse({
@@ -72,7 +76,6 @@ def create_room_api(request):
                 'message': '房间 ID 不能为空'
             }, status=400)
 
-        # 优先从请求中获取用户，其次从认证用户获取，最后从前端传来的用户名获取
         user = None
         if request.user and request.user.is_authenticated:
             user = request.user
@@ -92,13 +95,12 @@ def create_room_api(request):
 
         logger.info(f"创建房间: room_id={room_id}, game_id={game_id}, user={user}")
 
-        # 创建房间并设置创建者为黑方玩家
         room, created = GameRoom.objects.get_or_create(
             room_id=str(room_id),
             defaults={
                 'game_type': game_id,
                 'creator': user,
-                'player_black': user,  # 创建者自动成为黑方
+                'player_black': user,
                 'is_active': True
             }
         )
@@ -132,15 +134,15 @@ def create_room_api(request):
 @csrf_exempt
 @require_http_methods(["GET"])
 def rooms_api(request):
-    all_rooms = GameRoom.objects.filter(is_active=True) # 不要过滤 count < 2
+    all_rooms = GameRoom.objects.filter(is_active=True)
     rooms_data = []
     for room in all_rooms:
         count = 0
-        if room.player_black: count += 1  # 检查数据库字段
+        if room.player_black: count += 1
         if room.player_white: count += 1
         rooms_data.append({
             'id': room.room_id,
-            'playerCount': count, # 这里传给前端
+            'playerCount': count,
             'status': '等待中' if count < 2 else '游戏中'
         })
     return JsonResponse({'status': 'success', 'rooms': rooms_data})
