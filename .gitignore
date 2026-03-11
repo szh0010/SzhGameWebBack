@@ -1,28 +1,85 @@
-# Python 编译文件
+# === Python 编译与缓存 ===
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# 虚拟环境
+# === 虚拟环境 ===
+# 忽略所有常见的虚拟环境文件夹名
 venv/
 env/
 ENV/
+.venv/
+.env/
 
-# 数据库
+# === Django 特定文件 ===
+# 数据库：忽略本地测试数据库
+*.sqlite3
 db.sqlite3
-*.mysql  # 如果你有本地导出的 sql 文件
 
-# 重点：忽略用户上传的媒体文件
-# 我们只上传代码逻辑，不上传测试图片
+# 媒体文件：忽略用户上传的图片/头像（不进入代码库）
 media/
 
-# 静态文件收集
+# 静态文件：忽略 collectstatic 收集的结果
 staticfiles/
+static_root/
 
-# 操作系统临时文件
-.DS_Store
-Thumbs.db
+# 日志文件：忽略调试日志
+*.log
+logs/
 
-# 各种 IDE 配置
+# 密钥与本地配置：防止泄露 SECRET_KEY 或数据库密码
+.env
+local_settings.py
+
+# === 前端 (Vue/Node) 特定文件 ===
+# 如果你的前端代码也在这个目录下，这些必加
+node_modules/
+/dist/
+/target/
+.shorthand/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+.stylelintcache
+
+# === IDE 与 编辑器配置 ===
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# === 操作系统临时文件 ===
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# === 数据库备份/导出 ===
+*.sql
+*.mysql
+*.bak
