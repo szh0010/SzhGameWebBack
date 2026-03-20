@@ -5,12 +5,12 @@ from .views import StickyNoteViewSet, ProfileViewSet, index_view
 # 创建一个路由器
 router = DefaultRouter()
 
-# 1. 注册个人资料接口 (路径：/api/board/profile/)
-router.register(r'profile', ProfileViewSet, basename='profile')
+# 1. 注册便签墙接口 (核心修改：路径设为空 '')
+# 这样访问 /api/board/ 就会直接对应到便签墙的增删改查
+router.register(r'', StickyNoteViewSet, basename='stickynote')
 
-# 2. 注册便签墙接口 (路径：/api/board/sticky-notes/)
-# ✨ 这里的修改最关键：不再占用空路径
-router.register(r'sticky-notes', StickyNoteViewSet, basename='stickynote')
+# 2. 注册个人资料接口 (路径：/api/board/profile/)
+router.register(r'profile', ProfileViewSet, basename='profile')
 
 urlpatterns = [
     # 包含路由器生成的 API 路由

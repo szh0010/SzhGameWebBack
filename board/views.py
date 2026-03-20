@@ -14,11 +14,16 @@ class UnsafeSessionAuthentication(SessionAuthentication):
     def enforce_csrf(self, request):
         return  # 直接返回，不执行任何 CSRF 检查
 
-# 1. 便签墙 (保持不变)
+# 1. 便签墙
+@method_decorator(csrf_exempt, name='dispatch') # ✨ 加上这一行
 class StickyNoteViewSet(viewsets.ModelViewSet):
     queryset = StickyNote.objects.all().order_by('-created_at')
     serializer_class = StickyNoteSerializer
     permission_classes = [permissions.IsAuthenticated]
+    
+    # ✨ 核心修复：给便签墙也加上这个认证类，彻底解决 POST 时的 403/405 问题
+    authentication_classes = [UnsafeSessionAuthentication] 
+
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
@@ -27,7 +32,7 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
 class ProfileViewSet(viewsets.ModelViewSet):
     serializer_class = ProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
-    # ✨ 关键修复：使用我们自定义的认证类，彻底解决 403 问题
+    # ✨ 使用自定义的认证类，绕过 CSRF 检查
     authentication_classes = [UnsafeSessionAuthentication] 
 
     def get_queryset(self):

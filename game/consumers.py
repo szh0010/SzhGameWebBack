@@ -7,7 +7,8 @@ from django.contrib.auth.models import User
 from .models import GameRoom
 
 logger = logging.getLogger(__name__)
-# 内存中维护房间状态
+
+# 内存中维护房间状态（注：在多服务器部署时建议迁移至 Redis）
 rooms_state = {}
 
 class GameConsumer(AsyncWebsocketConsumer):
@@ -21,7 +22,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         username = query_params.get('username', [None])[0]
         self.user = await self.get_user_by_username(username)
 
-        # 2. 判定颜色
+        # 2. 判定颜色 (创建者永远是黑棋)
         self.color = await self.determine_player_color()
         
         if not self.user or self.color == 'error':
@@ -35,9 +36,10 @@ class GameConsumer(AsyncWebsocketConsumer):
                 'players': [],
                 'board': [[None for _ in range(15)] for _ in range(15)],
                 'game_over': False,
-                'current_turn': 'black'
+                'current_turn': 'black' # 黑棋先手
             }
         
+        # 记录当前连接的 channel
         if self.channel_name not in rooms_state[self.room_group_name]['players']:
             rooms_state[self.room_group_name]['players'].append(self.channel_name)
 
@@ -54,7 +56,7 @@ class GameConsumer(AsyncWebsocketConsumer):
             'color': self.color,
             'username': self.user.username
         }))
-        logger.info(f"玩家 {self.user.username} 已连接，颜色: {self.color}")
+        logger.info(f"玩家 {self.user.username} 已连接房间 {self.room_id}，颜色: {self.color}")
 
     # --- 数据库同步工具方法 ---
 
@@ -62,8 +64,10 @@ class GameConsumer(AsyncWebsocketConsumer):
     def determine_player_color(self):
         try:
             room_obj = GameRoom.objects.select_related('creator').get(room_id=self.room_id)
+            # 如果是创建者，分配黑棋（先手）
             if room_obj.creator == self.user:
                 return 'black'
+            # 后来者分配白棋
             else:
                 return 'white'
         except GameRoom.DoesNotExist:
@@ -79,8 +83,10 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def get_user_by_username(self, username):
-        try: return User.objects.get(username=username)
-        except: return None
+        try: 
+            return User.objects.get(username=username)
+        except: 
+            return None
 
     # --- 游戏逻辑处理 ---
 
@@ -89,17 +95,32 @@ class GameConsumer(AsyncWebsocketConsumer):
         room = rooms_state.get(self.room_group_name)
         if not room: return
 
+        # 【核心逻辑】：只有两名玩家都进入房间，才允许落子
+        if len(room['players']) < 2:
+            await self.send(text_data=json.dumps({
+                'type': 'info',
+                'message': '等待对手加入...'
+            }))
+            return
+
         if data.get('type') == 'move' and not room['game_over']:
+            # 检查是否是当前选手的回合
             if room['current_turn'] != self.color: return
             
             x, y = data['x'], data['y']
+            # 检查该位置是否已有子
             if room['board'][y][x] is not None: return
             
+            # 更新内存状态
             room['board'][y][x] = self.color
             winner = self.color if self.check_win(x, y, room['board']) else None
             next_turn = 'white' if self.color == 'black' else 'black'
             room['current_turn'] = next_turn
 
+            if winner:
+                room['game_over'] = True
+
+            # 广播落子消息
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
@@ -126,7 +147,7 @@ class GameConsumer(AsyncWebsocketConsumer):
             if count >= 5: return True
         return False
 
-    # --- 退出与清理逻辑 (核心修复区) ---
+    # --- 退出与清理逻辑 ---
 
     async def disconnect(self, close_code):
         # 1. 离开房间组
@@ -137,13 +158,13 @@ class GameConsumer(AsyncWebsocketConsumer):
             if self.channel_name in rooms_state[self.room_group_name]['players']:
                 rooms_state[self.room_group_name]['players'].remove(self.channel_name)
             
-            # 如果内存中该房间已无 channel 活跃，清理内存
+            # 如果内存中该房间已无 channel 活跃，清理内存状态
             if not rooms_state[self.room_group_name]['players']:
                 del rooms_state[self.room_group_name]
 
-        # 3. 数据库清理：移除玩家身份并销毁空房间
+        # 3. 数据库清理：移除玩家身份并销毁无人房间
         await self.cleanup_room_db()
-        logger.info(f"玩家已断开连接，尝试清理房间: {self.room_id}")
+        logger.info(f"连接断开: 房间ID {self.room_id}")
 
     @database_sync_to_async
     def cleanup_room_db(self):
@@ -151,14 +172,12 @@ class GameConsumer(AsyncWebsocketConsumer):
         try:
             # 重新获取房间对象
             room = GameRoom.objects.get(room_id=self.room_id)
-            
-            # 使用 connect 时已经确定的 self.user 避免访问 scope['user'] 报错
             current_username = self.user.username if self.user else None
             
             if not current_username:
                 return
 
-            # 移除对应位置的玩家记录
+            # 第一步：根据用户名移除对应的席位
             updated = False
             if room.player_black and room.player_black.username == current_username:
                 room.player_black = None
@@ -170,18 +189,18 @@ class GameConsumer(AsyncWebsocketConsumer):
             if updated:
                 room.save()
 
-            # 如果房间一个人都没了，彻底删除，防止出现“幽灵房间”
-            # 重新查询一遍确保准确
-            room.refresh_from_db()
+            # 第二步：检查房间是否已经全空
+            room.refresh_from_db() # 强制从数据库刷新数据，防止读取缓存
             if not room.player_black and not room.player_white:
                 room.delete()
-                logger.info(f"房间 {self.room_id} 已无玩家，执行物理删除。")
+                logger.info(f"房间 {self.room_id} 已经空无一人，物理删除成功。")
             else:
-                # 如果还有人在，确保 is_active 依然为 True
+                # 只要还有一个人在，保持房间活跃状态
                 room.is_active = True
                 room.save()
                 
         except GameRoom.DoesNotExist:
+            # 如果房间已经被另一方退出时删除了，则忽略报错
             pass
         except Exception as e:
             logger.error(f"清理房间数据库时发生异常: {e}")
