@@ -1,13 +1,30 @@
 from rest_framework import serializers
 from .models import StickyNote, Profile, ChatMessage
 
-# 1. 便签序列化器
+# 1. ✨ 升级版便签序列化器：包含空间位置字段
 class StickyNoteSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.username')
+    # 只读字段：显示点赞总数
+    likes_count = serializers.ReadOnlyField()
+    # 动态字段：判断当前登录用户是否已点赞
+    is_liked = serializers.SerializerMethodField()
 
     class Meta:
         model = StickyNote
-        fields = ['id', 'title', 'content', 'image', 'user', 'created_at']
+        # ✨ 新增了 x_position, y_position, rotation, z_index 到 fields 中
+        fields = [
+            'id', 'title', 'content', 'image', 'user', 
+            'created_at', 'likes_count', 'is_liked',
+            'x_position', 'y_position', 'rotation', 'z_index'
+        ]
+
+    def get_is_liked(self, obj):
+        # 从 context 中获取当前的 request 对象
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            # 判断当前用户是否在点赞列表（ManyToManyField）中
+            return obj.likes.filter(id=request.user.id).exists()
+        return False
 
 # 2. 个人资料序列化器
 class ProfileSerializer(serializers.ModelSerializer):
@@ -24,7 +41,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             'uid', 'username', 'nickname', 'avatar', 
             'gender', 'gender_display', 'birthday', 'bio', 'is_online'
         ]
-        # ✨ 重要：is_online 必须设为只读，由 WebSocket 逻辑控制状态
+        # is_online 必须设为只读，由 WebSocket 逻辑控制状态
         read_only_fields = ['is_online']
 
 # 3. 好友私聊消息序列化器

@@ -26,24 +26,44 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         # 创建时自动关联当前登录用户
         serializer.save(user=self.request.user)
 
-    # ✨ 新增：删除逻辑及其权限校验
+    # ✨ 新增：点赞/取消点赞 逻辑接口
+    # 访问路径：POST /api/board/{id}/toggle_like/
+    @decorators.action(detail=True, methods=['post'])
+    def toggle_like(self, request, pk=None):
+        note = self.get_object()
+        user = request.user
+        
+        # 如果用户已经点过赞，则移除（取消点赞）
+        if note.likes.filter(id=user.id).exists():
+            note.likes.remove(user)
+            action_status = "unliked"
+        else:
+            # 如果没点过，则添加（点赞）
+            note.likes.add(user)
+            action_status = "liked"
+        
+        # 返回最新状态，让前端实时更新 UI
+        return Response({
+            "status": action_status,
+            "likes_count": note.likes_count,
+            "is_liked": note.likes.filter(id=user.id).exists()
+        })
+
+    # 删除逻辑及其权限校验
     def destroy(self, request, *args, **kwargs):
         """
         处理 DELETE 请求：/api/board/{id}/
         """
-        # 获取要删除的便签对象
         instance = self.get_object()
         
-        # 权限校验：如果该便签的拥有者不是当前请求的用户，则拒绝操作
+        # 权限校验：非拥有者不能删除
         if instance.user != request.user:
             return Response(
                 {"error": "你没有权限删除他人的便签"}, 
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        # 执行删除
         self.perform_destroy(instance)
-        # 返回 204 No Content 代表成功
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 # --- 3. 个人资料与好友社交逻辑 ---
@@ -56,7 +76,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return Profile.objects.all()
 
-    # 处理 /api/board/profile/me/ (获取/修改个人资料)
+    # 处理 /api/board/profile/me/
     @decorators.action(detail=False, methods=['get', 'patch'])
     def me(self, request):
         profile = request.user.profile
@@ -81,7 +101,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
             return Response({"error": "找不到该用户"}, status=404)
         return Response(self.get_serializer(request.user.profile).data)
 
-    # B. 发送申请 (POST)
+    # B. 发送申请
     @decorators.action(detail=False, methods=['post'])
     def add_friend(self, request):
         target_uid = request.data.get('to_uid')
@@ -105,7 +125,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
         except (User.DoesNotExist, ValueError, TypeError):
             return Response({"error": "用户不存在"}, status=404)
 
-    # C. 获取“申请通知”列表
+    # C. 获取“申请通知”
     @decorators.action(detail=False, methods=['get'])
     def my_requests(self, request):
         reqs = FriendRequest.objects.filter(to_user=request.user, status='pending')
@@ -117,7 +137,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
         } for r in reqs]
         return Response(data)
 
-    # D. 获取“我的好友”列表
+    # D. 获取“我的好友”
     @decorators.action(detail=False, methods=['get'])
     def my_friends(self, request):
         friend_conns = FriendRequest.objects.filter(
