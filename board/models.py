@@ -28,20 +28,21 @@ class Profile(models.Model):
     gender = models.CharField(max_length=1, choices=GENDER_CHOICES, default='O', verbose_name="性别")
     birthday = models.DateField(null=True, blank=True, verbose_name="生日")
     bio = models.TextField(max_length=500, blank=True, verbose_name="个人简介")
+    
+    # ✨ 新增：在线状态字段
+    is_online = models.BooleanField(default=False, verbose_name="是否在线")
 
     def __str__(self):
         return f"{self.user.username} 的个人资料"
 
-# 3. ✨ 新增：好友申请模型
+# 3. 好友申请模型
 class FriendRequest(models.Model):
-    # 发送者 (from_user)
     from_user = models.ForeignKey(
         User, 
         related_name='sent_requests', 
         on_delete=models.CASCADE, 
         verbose_name="发送者"
     )
-    # 接收者 (to_user)
     to_user = models.ForeignKey(
         User, 
         related_name='received_requests', 
@@ -49,7 +50,6 @@ class FriendRequest(models.Model):
         verbose_name="接收者"
     )
     
-    # 申请状态
     status = models.CharField(
         max_length=10, 
         choices=[
@@ -64,7 +64,6 @@ class FriendRequest(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="申请时间")
 
     class Meta:
-        # 核心设置：防止重复发送申请（同一个人对同一个人只能存在一条记录）
         unique_together = ('from_user', 'to_user')
         verbose_name = "好友申请记录"
         verbose_name_plural = verbose_name
@@ -72,17 +71,39 @@ class FriendRequest(models.Model):
     def __str__(self):
         return f"{self.from_user.username} -> {self.to_user.username} ({self.status})"
 
-# --- 4. 自动化信号 (Signals) ---
-# 逻辑：当 User 表有新数据创建时，自动触发创建 Profile
+# 4. 好友私聊记录模型
+class ChatMessage(models.Model):
+    sender = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='sent_messages', 
+        verbose_name="发送者"
+    )
+    receiver = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='received_messages', 
+        verbose_name="接收者"
+    )
+    content = models.TextField(verbose_name="消息内容")
+    timestamp = models.DateTimeField(auto_now_add=True, verbose_name="发送时间")
+    is_read = models.BooleanField(default=False, verbose_name="是否已读")
+
+    class Meta:
+        ordering = ['timestamp']
+        verbose_name = "私聊消息"
+        verbose_name_plural = verbose_name
+
+    def __str__(self):
+        return f"{self.sender.username} -> {self.receiver.username}: {self.content[:20]}"
+
+# --- 5. 自动化信号 (Signals) ---
 @receiver(post_save, sender=User)
 def create_user_profile(sender, instance, created, **kwargs):
     if created:
-        # 使用 get_or_create 增强健壮性，防止重复创建报错
         Profile.objects.get_or_create(user=instance)
 
-# 逻辑：当 User 数据保存时，同步保存 Profile
 @receiver(post_save, sender=User)
 def save_user_profile(sender, instance, **kwargs):
-    # 确保 instance 有 profile 属性再进行保存
     if hasattr(instance, 'profile'):
         instance.profile.save()
