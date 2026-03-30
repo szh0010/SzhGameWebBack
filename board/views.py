@@ -26,23 +26,19 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         # 创建时自动关联当前登录用户
         serializer.save(user=self.request.user)
 
-    # ✨ 新增：点赞/取消点赞 逻辑接口
-    # 访问路径：POST /api/board/{id}/toggle_like/
+    # 点赞/取消点赞 逻辑接口
     @decorators.action(detail=True, methods=['post'])
     def toggle_like(self, request, pk=None):
         note = self.get_object()
         user = request.user
         
-        # 如果用户已经点过赞，则移除（取消点赞）
         if note.likes.filter(id=user.id).exists():
             note.likes.remove(user)
             action_status = "unliked"
         else:
-            # 如果没点过，则添加（点赞）
             note.likes.add(user)
             action_status = "liked"
         
-        # 返回最新状态，让前端实时更新 UI
         return Response({
             "status": action_status,
             "likes_count": note.likes_count,
@@ -51,18 +47,12 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
 
     # 删除逻辑及其权限校验
     def destroy(self, request, *args, **kwargs):
-        """
-        处理 DELETE 请求：/api/board/{id}/
-        """
         instance = self.get_object()
-        
-        # 权限校验：非拥有者不能删除
         if instance.user != request.user:
             return Response(
                 {"error": "你没有权限删除他人的便签"}, 
                 status=status.HTTP_403_FORBIDDEN
             )
-        
         self.perform_destroy(instance)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -90,15 +80,33 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    # A. 搜索用户
+    # ✨ A. 搜索用户（修复加固版）
     def list(self, request, *args, **kwargs):
-        uid = request.query_params.get('uid')
-        if uid:
-            uid = uid.strip().strip('/')
-            target = Profile.objects.filter(user__id=uid).first()
-            if target:
-                return Response(self.get_serializer(target).data)
-            return Response({"error": "找不到该用户"}, status=404)
+        uid_query = request.query_params.get('uid')
+        
+        if uid_query:
+            # 1. 清洗输入数据
+            uid_query = uid_query.strip().strip('/')
+            
+            target_profile = None
+            
+            # 2. 尝试按 ID 搜索
+            if uid_query.isdigit():
+                target_profile = Profile.objects.filter(user__id=int(uid_query)).first()
+            
+            # 3. 如果按 ID 没搜到，尝试按用户名（Username）直接搜索
+            # 这样用户输入 ID 或 用户名 都能搜到人，体验更好
+            if not target_profile:
+                target_profile = Profile.objects.filter(user__username=uid_query).first()
+            
+            if target_profile:
+                serializer = self.get_serializer(target_profile)
+                return Response(serializer.data)
+            
+            # 4. 如果还是没搜到，说明可能真的没这个人，或者该用户没有 Profile 记录
+            return Response({"error": "🔍 未找到该用户，请检查 ID 或用户名是否正确"}, status=404)
+        
+        # 如果没有传 uid 参数，默认返回自己的资料
         return Response(self.get_serializer(request.user.profile).data)
 
     # B. 发送申请
