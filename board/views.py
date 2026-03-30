@@ -66,7 +66,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return Profile.objects.all()
 
-    # 处理 /api/board/profile/me/
+    # 获取/修改个人资料
     @decorators.action(detail=False, methods=['get', 'patch'])
     def me(self, request):
         profile = request.user.profile
@@ -80,33 +80,35 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    # ✨ A. 搜索用户（修复加固版）
+    # ✨ A. 搜索用户（深度加固版）
     def list(self, request, *args, **kwargs):
         uid_query = request.query_params.get('uid')
         
         if uid_query:
-            # 1. 清洗输入数据
-            uid_query = uid_query.strip().strip('/')
+            # 1. 彻底清洗输入，去除空格、换行符和末尾斜杠
+            clean_uid = uid_query.strip().strip('/')
+            
+            # 打印调试信息到服务器日志 (django.log)
+            print(f"[DEBUG] 正在搜索 UID: '{clean_uid}'")
             
             target_profile = None
             
-            # 2. 尝试按 ID 搜索
-            if uid_query.isdigit():
-                target_profile = Profile.objects.filter(user__id=int(uid_query)).first()
+            # 2. 尝试按 User ID 搜索 (强制转换为 int)
+            if clean_uid.isdigit():
+                target_profile = Profile.objects.filter(user__id=int(clean_uid)).first()
             
-            # 3. 如果按 ID 没搜到，尝试按用户名（Username）直接搜索
-            # 这样用户输入 ID 或 用户名 都能搜到人，体验更好
+            # 3. 如果 ID 没搜到，尝试按用户名匹配
             if not target_profile:
-                target_profile = Profile.objects.filter(user__username=uid_query).first()
+                target_profile = Profile.objects.filter(user__username=clean_uid).first()
             
             if target_profile:
-                serializer = self.get_serializer(target_profile)
+                # 传递 context 以确保序列化器能生成完整的图片 URL
+                serializer = self.get_serializer(target_profile, context={'request': request})
                 return Response(serializer.data)
             
-            # 4. 如果还是没搜到，说明可能真的没这个人，或者该用户没有 Profile 记录
-            return Response({"error": "🔍 未找到该用户，请检查 ID 或用户名是否正确"}, status=404)
+            return Response({"error": f"🔍 未找到用户 '{clean_uid}'，请确认 ID 是否正确"}, status=404)
         
-        # 如果没有传 uid 参数，默认返回自己的资料
+        # 默认返回自己的资料
         return Response(self.get_serializer(request.user.profile).data)
 
     # B. 发送申请
