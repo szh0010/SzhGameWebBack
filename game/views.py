@@ -1,24 +1,24 @@
+import json
+import logging
 from django.contrib.auth import authenticate, login
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 from django.utils.decorators import method_decorator 
-import json
-import logging
 
 from django.contrib.auth.models import User
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions 
-from .models import GameRoom
+from rest_framework.authtoken.models import Token  # ✨ 核心导入：Token 模型
 
-# --- 核心新增：导入 Profile 模型 ---
+from .models import GameRoom
 from board.models import Profile 
 
 logger = logging.getLogger(__name__)
 
-# --- 1. 登录接口 ---
-@ensure_csrf_cookie  # 确保在登录响应中包含 CSRF Cookie
+# --- 1. 登录接口 (修复版) ---
+@ensure_csrf_cookie
 @csrf_exempt
 def login_api(request):
     if request.method == 'POST':
@@ -30,18 +30,21 @@ def login_api(request):
             user = authenticate(username=username, password=password)
             
             if user is not None:
-                # 1. 执行 Django 标准登录，建立 Session
+                # 1. 执行 Session 登录 (用于普通 API)
                 login(request, user)
                 
-                # 2. ✨ 关键修复：强制保存 Session
-                # 确保 sessionid 能够立即写入数据库并生成响应 Cookie
                 if not request.session.session_key:
                     request.session.create()
                 request.session.save()
+
+                # 2. ✨ 核心修复：获取或创建该用户的 Token (用于 WebSocket)
+                # 这就是你缺少的“发钥匙”环节
+                token, _ = Token.objects.get_or_create(user=user)
                 
-                # 3. 返回用户信息
+                # 3. 返回包含 token 的完整数据
                 return JsonResponse({
                     'status': 'success', 
+                    'token': token.key,  # 👈 前端存入 localStorage 的就是它！
                     'id': user.id,          
                     'user': user.username,
                     'msg': '登录成功'
@@ -57,7 +60,7 @@ def login_api(request):
     return JsonResponse({'status': 'error', 'message': '仅支持 POST 请求'}, status=405)
 
 
-# --- 2. 注册接口 (类视图) ---
+# --- 2. 注册接口 (修复版) ---
 @method_decorator(csrf_exempt, name='dispatch')
 class RegisterView(APIView):
     authentication_classes = [] 
@@ -74,17 +77,23 @@ class RegisterView(APIView):
             return Response({'error': '用户名已存在'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # 1. 创建用户账号
+            # 1. 创建用户
             user = User.objects.create_user(username=username, password=password)
             
-            # 2. --- 同步创建个人资料 ---
-            # 确保新用户在 Profile 表中有记录，搜索功能才能工作
+            # 2. 创建资料
             Profile.objects.get_or_create(
                 user=user, 
                 defaults={'nickname': username}
             )
+
+            # 3. ✨ 顺手也为新注册用户预创建 Token
+            token, _ = Token.objects.get_or_create(user=user)
             
-            return Response({'message': '注册成功', 'status': 'success'}, status=status.HTTP_201_CREATED)
+            return Response({
+                'message': '注册成功', 
+                'status': 'success',
+                'token': token.key  # 注册完也可以直接给钥匙
+            }, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': f'注册失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -103,7 +112,6 @@ def create_room_api(request):
             return JsonResponse({'status': 'error', 'message': '房间 ID 不能为空'}, status=400)
 
         user = None
-        # 优先从 Session 获取已登录用户
         if request.user and request.user.is_authenticated:
             user = request.user
         elif username:
@@ -111,8 +119,6 @@ def create_room_api(request):
                 user = User.objects.get(username=username)
             except User.DoesNotExist:
                 return JsonResponse({'status': 'error', 'message': f'用户 {username} 不存在'}, status=400)
-        else:
-            return JsonResponse({'status': 'error', 'message': '必须指定用户名'}, status=400)
 
         room, created = GameRoom.objects.get_or_create(
             room_id=str(room_id),

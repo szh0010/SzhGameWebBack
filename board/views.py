@@ -1,18 +1,23 @@
-from rest_framework import viewsets, permissions, status, decorators, views
-from rest_framework.response import Response
-from rest_framework.authentication import SessionAuthentication
-from .models import StickyNote, Profile, FriendRequest, ChatMessage
-from .serializers import StickyNoteSerializer, ProfileSerializer, ChatMessageSerializer
-from django.shortcuts import render
+import logging
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from django.shortcuts import render
 
-# --- 1. 一个“不检查 CSRF”的认证类 ---
+from rest_framework import viewsets, permissions, status, decorators, views
+from rest_framework.response import Response
+from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+
+from .models import StickyNote, Profile, FriendRequest, ChatMessage
+from .serializers import StickyNoteSerializer, ProfileSerializer, ChatMessageSerializer
+
+logger = logging.getLogger(__name__)
+
+# --- 1. 认证类：跳过 CSRF 检查以支持多端发布 ---
 class UnsafeSessionAuthentication(SessionAuthentication):
     def enforce_csrf(self, request):
-        return  # 直接返回，不执行任何 CSRF 检查
+        return 
 
 # --- 2. 便签墙 (Felt Board) ---
 @method_decorator(csrf_exempt, name='dispatch')
@@ -20,48 +25,33 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
     queryset = StickyNote.objects.all().order_by('-created_at')
     serializer_class = StickyNoteSerializer
     permission_classes = [permissions.IsAuthenticated]
-    authentication_classes = [UnsafeSessionAuthentication] 
+    authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
 
     def perform_create(self, serializer):
-        # 创建时自动关联当前登录用户
+        # 自动将当前登录用户保存为发布者
         serializer.save(user=self.request.user)
 
-    # 点赞/取消点赞 逻辑接口
     @decorators.action(detail=True, methods=['post'])
     def toggle_like(self, request, pk=None):
         note = self.get_object()
         user = request.user
-        
         if note.likes.filter(id=user.id).exists():
             note.likes.remove(user)
-            action_status = "unliked"
+            is_liked = False
         else:
             note.likes.add(user)
-            action_status = "liked"
-        
+            is_liked = True
         return Response({
-            "status": action_status,
-            "likes_count": note.likes_count,
-            "is_liked": note.likes.filter(id=user.id).exists()
+            "likes_count": note.likes.count(),
+            "is_liked": is_liked
         })
-
-    # 删除逻辑及其权限校验
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if instance.user != request.user:
-            return Response(
-                {"error": "你没有权限删除他人的便签"}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        self.perform_destroy(instance)
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
 # --- 3. 个人资料与好友社交逻辑 ---
 @method_decorator(csrf_exempt, name='dispatch')
 class ProfileViewSet(viewsets.ModelViewSet):
     serializer_class = ProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
-    authentication_classes = [UnsafeSessionAuthentication] 
+    authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
 
     def get_queryset(self):
         return Profile.objects.all()
@@ -69,7 +59,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
     # 获取/修改个人资料
     @decorators.action(detail=False, methods=['get', 'patch'])
     def me(self, request):
-        profile = request.user.profile
+        profile, _ = Profile.objects.get_or_create(user=request.user)
         if request.method == 'GET':
             serializer = self.get_serializer(profile)
             return Response(serializer.data)
@@ -80,98 +70,114 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 return Response(serializer.data)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    # ✨ A. 搜索用户（深度加固版）
+    # ✨ 核心搜索修复：根据搜索结果数量自动切换 [{}, {}] 或 {} 格式
     def list(self, request, *args, **kwargs):
-        uid_query = request.query_params.get('uid')
+        # 获取查询参数
+        uid_param = request.query_params.get('uid')
+        q_param = request.query_params.get('q')
+        user_param = request.query_params.get('username')
+        query = uid_param or q_param or user_param
         
-        if uid_query:
-            # 1. 彻底清洗输入，去除空格、换行符和末尾斜杠
-            clean_uid = uid_query.strip().strip('/')
+        if query:
+            clean_query = str(query).strip().strip('/')
             
-            # 打印调试信息到服务器日志 (django.log)
-            print(f"[DEBUG] 正在搜索 UID: '{clean_uid}'")
+            # 1. 构造搜索条件：用户名模糊匹配或 ID 精确匹配
+            user_filter = Q(username__iexact=clean_query)
+            if clean_query.isdigit():
+                user_filter |= Q(id=int(clean_query))
             
-            target_profile = None
-            
-            # 2. 尝试按 User ID 搜索 (强制转换为 int)
-            if clean_uid.isdigit():
-                target_profile = Profile.objects.filter(user__id=int(clean_uid)).first()
-            
-            # 3. 如果 ID 没搜到，尝试按用户名匹配
-            if not target_profile:
-                target_profile = Profile.objects.filter(user__username=clean_uid).first()
-            
-            if target_profile:
-                # 传递 context 以确保序列化器能生成完整的图片 URL
-                serializer = self.get_serializer(target_profile, context={'request': request})
-                return Response(serializer.data)
-            
-            return Response({"error": f"🔍 未找到用户 '{clean_uid}'，请确认 ID 是否正确"}, status=404)
-        
-        # 默认返回自己的资料
-        return Response(self.get_serializer(request.user.profile).data)
+            target_users = User.objects.filter(user_filter)
 
-    # B. 发送申请
+            if not target_users.exists():
+                return Response({"error": f"🔍 未找到用户 '{clean_query}'"}, status=404)
+
+            # 2. 检查是否搜到自己
+            if target_users.count() == 1 and target_users.first() == request.user:
+                return Response({"error": "这是你自己哦，不能添加自己"}, status=400)
+
+            # 3. 确保 Profile 记录存在并排除自己
+            profiles = []
+            for u in target_users.exclude(id=request.user.id):
+                p, _ = Profile.objects.get_or_create(user=u)
+                profiles.append(p)
+
+            # ✨ 关键：如果通过 uid 搜，或结果只有一个，直接返回对象 {} 而非数组 []
+            if (uid_param or len(profiles) == 1) and len(profiles) > 0:
+                serializer = self.get_serializer(profiles[0])
+                return Response(serializer.data)
+            else:
+                serializer = self.get_serializer(profiles, many=True)
+                return Response(serializer.data)
+        
+        return Response([])
+
+    # B. 发送好友申请
     @decorators.action(detail=False, methods=['post'])
     def add_friend(self, request):
         target_uid = request.data.get('to_uid')
+        if not target_uid:
+            return Response({"error": "缺少目标用户ID"}, status=400)
+        
         try:
             to_user = User.objects.get(id=int(target_uid))
             if to_user == request.user:
-                return Response({"error": "不能加自己为好友"}, status=400)
+                return Response({"error": "不能加自己"}, status=400)
             
-            if FriendRequest.objects.filter(
+            # 检查是否已经是好友
+            is_friend = FriendRequest.objects.filter(
                 (Q(from_user=request.user, to_user=to_user) | Q(from_user=to_user, to_user=request.user)),
                 status='accepted'
-            ).exists():
+            ).exists()
+            if is_friend:
                 return Response({"error": "你们已经是好友了"}, status=400)
 
-            obj, created = FriendRequest.objects.get_or_create(
+            # 检查是否有待处理的申请
+            FriendRequest.objects.get_or_create(
                 from_user=request.user,
                 to_user=to_user,
                 defaults={'status': 'pending'}
             )
-            return Response({"message": "申请已发送" if created else "请勿重复发送"})
+            return Response({"message": "申请已发送"})
         except (User.DoesNotExist, ValueError, TypeError):
             return Response({"error": "用户不存在"}, status=404)
 
-    # C. 获取“申请通知”
+    # C. 获取好友列表 (WebSocket 状态灯的基础)
+    @decorators.action(detail=False, methods=['get'])
+    def my_friends(self, request):
+        friend_conns = FriendRequest.objects.filter(
+            (Q(from_user=request.user) | Q(to_user=request.user)), status='accepted'
+        ).select_related('from_user__profile', 'to_user__profile')
+        
+        data = []
+        for conn in friend_conns:
+            friend = conn.to_user if conn.from_user == request.user else conn.from_user
+            p, _ = Profile.objects.get_or_create(user=friend)
+            data.append({
+                "uid": int(friend.id),
+                "username": str(friend.username),
+                "nickname": str(p.nickname or friend.username),
+                "avatar": p.avatar.url if p.avatar else None,
+                "is_online": bool(p.is_online)
+            })
+        return Response(data)
+
+    # D. 获取好友请求列表
     @decorators.action(detail=False, methods=['get'])
     def my_requests(self, request):
         reqs = FriendRequest.objects.filter(to_user=request.user, status='pending')
         data = [{
             "id": r.id,
-            "from_uid": r.from_user.id,
-            "from_name": r.from_user.username,
+            "from_uid": int(r.from_user.id),
+            "from_name": str(r.from_user.username),
             "time": r.created_at.strftime("%Y-%m-%d %H:%M")
         } for r in reqs]
         return Response(data)
 
-    # D. 获取“我的好友”
-    @decorators.action(detail=False, methods=['get'])
-    def my_friends(self, request):
-        friend_conns = FriendRequest.objects.filter(
-            (Q(from_user=request.user) | Q(to_user=request.user)),
-            status='accepted'
-        )
-        friends_data = []
-        for conn in friend_conns:
-            friend_user = conn.to_user if conn.from_user == request.user else conn.from_user
-            profile = friend_user.profile
-            friends_data.append({
-                "uid": friend_user.id,
-                "username": friend_user.username,
-                "nickname": profile.nickname,
-                "avatar": profile.avatar.url if profile.avatar else None,
-                "is_online": profile.is_online  
-            })
-        return Response(friends_data)
-
-    # E. 同意/拒绝申请
+    # E. 处理好友申请
     @decorators.action(detail=False, methods=['post'])
     def handle_request(self, request):
         req_id = request.data.get('req_id')
-        action = request.data.get('action') 
+        action = request.data.get('action') # 'accept' 或 'reject'
         try:
             req_obj = FriendRequest.objects.get(id=req_id, to_user=request.user)
             if action == 'accept':
@@ -182,20 +188,19 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 req_obj.delete()
                 return Response({"message": "已忽略申请"})
         except FriendRequest.DoesNotExist:
-            return Response({"error": "申请不存在"}, status=404)
+            return Response({"error": "该申请已失效或已处理"}, status=404)
 
-# --- 4. 获取历史聊天记录接口 ---
+# --- 4. 历史记录接口 ---
 class ChatHistoryView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
-    authentication_classes = [UnsafeSessionAuthentication]
-
+    authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
+    
     def get(self, request, friend_id):
-        user = request.user
+        # 查询当前用户与指定好友之间的所有消息
         messages = ChatMessage.objects.filter(
-            (Q(sender=user) & Q(receiver_id=friend_id)) |
-            (Q(sender_id=friend_id) & Q(receiver=user))
+            (Q(sender=request.user) & Q(receiver_id=friend_id)) | 
+            (Q(sender_id=friend_id) & Q(receiver=request.user))
         ).order_by('timestamp')
-
         serializer = ChatMessageSerializer(messages, many=True)
         return Response(serializer.data)
 

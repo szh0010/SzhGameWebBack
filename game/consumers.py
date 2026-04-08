@@ -8,7 +8,7 @@ from .models import GameRoom
 
 logger = logging.getLogger(__name__)
 
-# 内存中维护房间状态（注：在多服务器部署时建议迁移至 Redis）
+# 内存中维护房间内的下棋状态
 rooms_state = {}
 
 class GameConsumer(AsyncWebsocketConsumer):
@@ -16,191 +16,192 @@ class GameConsumer(AsyncWebsocketConsumer):
         self.game_id = self.scope['url_route']['kwargs']['game_id']
         self.room_id = str(self.scope['url_route']['kwargs']['room_id'])
         self.room_group_name = f"game_{self.game_id}_{self.room_id}"
-
-        # 1. 获取 URL 中的用户名
-        query_params = parse_qs(self.scope.get('query_string', b'').decode())
-        username = query_params.get('username', [None])[0]
-        self.user = await self.get_user_by_username(username)
-
-        # 2. 判定颜色 (创建者永远是黑棋)
-        self.color = await self.determine_player_color()
         
-        if not self.user or self.color == 'error':
-            logger.warning(f"拒绝连接: 用户={username}, 颜色状态={self.color}")
-            await self.close(code=4001)
+        params = parse_qs(self.scope.get('query_string', b'').decode())
+        username = params.get('username', [None])[0]
+        role = params.get('role', [None])[0]
+        
+        self.user = await self.get_user_by_username(username)
+        if not self.user:
+            await self.close()
             return
 
-        # 3. 初始化内存房间状态
+        self.color = await self.determine_color_db(role)
+        
+        # 1. 初始化内存房间状态
         if self.room_group_name not in rooms_state:
             rooms_state[self.room_group_name] = {
-                'players': [],
                 'board': [[None for _ in range(15)] for _ in range(15)],
                 'game_over': False,
-                'current_turn': 'black' # 黑棋先手
+                'current_turn': 'black',
+                'active_users': set() # 用于追踪在线人数
             }
         
-        # 记录当前连接的 channel
-        if self.channel_name not in rooms_state[self.room_group_name]['players']:
-            rooms_state[self.room_group_name]['players'].append(self.channel_name)
-
-        # 4. 同步身份到数据库
-        await self.sync_player_to_db()
-
-        # 5. 加入群组并接受连接
+        rooms_state[self.room_group_name]['active_users'].add(self.user.username)
+        
+        # 2. 同步数据库并加入频道
+        await self.sync_db()
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
-        # 6. 发送初始化数据
+        # 3. ✨ 关键：有人进入，立刻向全房间广播成员名单和就绪状态
+        await self.broadcast_room_info()
+
+    async def broadcast_room_info(self):
+        """同步黑白双方姓名及是否就绪"""
+        info = await self.get_players_db()
+        # 只要内存里有两个不同的人，或者数据库里两个席位都满了，就设为 ready
+        is_ready = len(rooms_state[self.room_group_name]['active_users']) >= 2 or info['full']
+        
+        # ⚠️ 注意：这里传递给 group_send 的必须是可序列化的类型（字符串/布尔值）
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "room_init_send",
+                "black": str(info['black']),
+                "white": str(info['white']),
+                "ready": bool(is_ready)
+            }
+        )
+
+    async def room_init_send(self, e):
+        """发送给前端 init 消息"""
+        # ✨ 修复 TypeError: 这里的 e['black'] 等已经是字符串，不再是 User 对象
         await self.send(text_data=json.dumps({
-            'type': 'init',
-            'color': self.color,
-            'username': self.user.username
+            "type": "init",
+            "color": self.color,
+            "black_player": e["black"],
+            "white_player": e["white"],
+            "is_ready": e["ready"]
         }))
-        logger.info(f"玩家 {self.user.username} 已连接房间 {self.room_id}，颜色: {self.color}")
-
-    # --- 数据库同步工具方法 ---
-
-    @database_sync_to_async
-    def determine_player_color(self):
-        try:
-            room_obj = GameRoom.objects.select_related('creator').get(room_id=self.room_id)
-            # 如果是创建者，分配黑棋（先手）
-            if room_obj.creator == self.user:
-                return 'black'
-            # 后来者分配白棋
-            else:
-                return 'white'
-        except GameRoom.DoesNotExist:
-            return 'error'
-
-    @database_sync_to_async
-    def sync_player_to_db(self):
-        """将当前用户写入数据库对应位置并激活房间"""
-        if self.color == 'black':
-            GameRoom.objects.filter(room_id=self.room_id).update(player_black=self.user, is_active=True)
-        else:
-            GameRoom.objects.filter(room_id=self.room_id).update(player_white=self.user, is_active=True)
-
-    @database_sync_to_async
-    def get_user_by_username(self, username):
-        try: 
-            return User.objects.get(username=username)
-        except: 
-            return None
-
-    # --- 游戏逻辑处理 ---
 
     async def receive(self, text_data):
         data = json.loads(text_data)
         room = rooms_state.get(self.room_group_name)
-        if not room: return
-
-        # 【核心逻辑】：只有两名玩家都进入房间，才允许落子
-        if len(room['players']) < 2:
-            await self.send(text_data=json.dumps({
-                'type': 'info',
-                'message': '等待对手加入...'
-            }))
+        if not room or room['game_over']:
             return
 
-        if data.get('type') == 'move' and not room['game_over']:
-            # 检查是否是当前选手的回合
-            if room['current_turn'] != self.color: return
-            
+        if data.get('type') == 'move':
+            # ✨ 判定：必须有两人在房间才允许落子
+            if len(room['active_users']) < 2:
+                await self.send(text_data=json.dumps({
+                    "type": "info", 
+                    "message": "等待对手入场..."
+                }))
+                return
+
+            if room['current_turn'] != self.color:
+                return
+                
             x, y = data['x'], data['y']
-            # 检查该位置是否已有子
-            if room['board'][y][x] is not None: return
+            if room['board'][y][x] is not None:
+                return
             
-            # 更新内存状态
+            # 执行落子
             room['board'][y][x] = self.color
-            winner = self.color if self.check_win(x, y, room['board']) else None
-            next_turn = 'white' if self.color == 'black' else 'black'
-            room['current_turn'] = next_turn
-
-            if winner:
+            win = self.check_win(x, y, room['board'])
+            next_t = 'white' if self.color == 'black' else 'black'
+            room['current_turn'] = next_t
+            
+            if win:
                 room['game_over'] = True
-
-            # 广播落子消息
+            
+            # 广播落子结果
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
-                    'type': 'game_move', 
-                    'x': x, 'y': y, 
-                    'color': self.color, 
-                    'next_turn': next_turn, 
-                    'winner': winner
+                    "type": "move_send",
+                    "x": x, "y": y,
+                    "color": self.color,
+                    "next": next_t,
+                    "win": bool(win)
                 }
             )
 
-    async def game_move(self, event):
-        await self.send(text_data=json.dumps(event))
+    async def move_send(self, e):
+        await self.send(json.dumps({
+            "type": "game_move",
+            "x": e["x"],
+            "y": e["y"],
+            "color": e["color"],
+            "next_turn": e["next"],
+            "winner": e["color"] if e["win"] else None
+        }))
+
+    @database_sync_to_async
+    def determine_color_db(self, r):
+        try:
+            room = GameRoom.objects.get(room_id=self.room_id)
+            if r in ['black', 'white']: return r
+            return 'black' if room.creator == self.user else 'white'
+        except:
+            return 'black'
+
+    @database_sync_to_async
+    def get_players_db(self):
+        """从数据库获取玩家名，确保返回的是字符串而非 User 对象"""
+        try:
+            r = GameRoom.objects.get(room_id=self.room_id)
+            bn = r.player_black.username if r.player_black else "等待中..."
+            wn = r.player_white.username if r.player_white else "等待中..."
+            return {
+                "black": str(bn), 
+                "white": str(wn), 
+                "full": (r.player_black is not None and r.player_white is not None)
+            }
+        except:
+            return {"black": "未知", "white": "未知", "full": False}
+
+    @database_sync_to_async
+    def sync_db(self):
+        f = 'player_black' if self.color == 'black' else 'player_white'
+        GameRoom.objects.filter(room_id=self.room_id).update(**{f: self.user, 'is_active': True})
+
+    @database_sync_to_async
+    def get_user_by_username(self, u):
+        try:
+            return User.objects.get(username=u)
+        except:
+            return None
 
     def check_win(self, x, y, board):
         color = board[y][x]
         for dx, dy in [(1,0), (0,1), (1,1), (1,-1)]:
-            count = 1
+            cnt = 1
             for i in [1, -1]:
                 nx, ny = x + dx*i, y + dy*i
                 while 0<=nx<15 and 0<=ny<15 and board[ny][nx] == color:
-                    count += 1
+                    cnt += 1
                     nx, ny = nx + dx*i, ny + dy*i
-            if count >= 5: return True
+            if cnt >= 5: return True
         return False
 
-    # --- 退出与清理逻辑 ---
-
-    async def disconnect(self, close_code):
-        # 1. 离开房间组
-        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
-
-        # 2. 从内存状态中移除玩家
+    async def disconnect(self, code):
+        # 从内存活跃列表中移除
         if self.room_group_name in rooms_state:
-            if self.channel_name in rooms_state[self.room_group_name]['players']:
-                rooms_state[self.room_group_name]['players'].remove(self.channel_name)
-            
-            # 如果内存中该房间已无 channel 活跃，清理内存状态
-            if not rooms_state[self.room_group_name]['players']:
-                del rooms_state[self.room_group_name]
-
-        # 3. 数据库清理：移除玩家身份并销毁无人房间
-        await self.cleanup_room_db()
-        logger.info(f"连接断开: 房间ID {self.room_id}")
+            rooms_state[self.room_group_name]['active_users'].discard(self.user.username)
+        
+        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+        
+        # 4. ✨ 核心清理：更新数据库席位
+        await self.cleanup_db()
+        
+        # 有人离开后，通知剩下的那个人更新名单
+        await self.broadcast_room_info()
 
     @database_sync_to_async
-    def cleanup_room_db(self):
-        """核心销毁逻辑：在同步上下文中安全修改数据库"""
+    def cleanup_db(self):
         try:
-            # 重新获取房间对象
-            room = GameRoom.objects.get(room_id=self.room_id)
-            current_username = self.user.username if self.user else None
+            r = GameRoom.objects.get(room_id=self.room_id)
+            # 如果是当前用户断开，清空对应的坑位
+            if r.player_black == self.user:
+                r.player_black = None
+            elif r.player_white == self.user:
+                r.player_white = None
+            r.save()
             
-            if not current_username:
-                return
-
-            # 第一步：根据用户名移除对应的席位
-            updated = False
-            if room.player_black and room.player_black.username == current_username:
-                room.player_black = None
-                updated = True
-            elif room.player_white and room.player_white.username == current_username:
-                room.player_white = None
-                updated = True
-            
-            if updated:
-                room.save()
-
-            # 第二步：检查房间是否已经全空
-            room.refresh_from_db() # 强制从数据库刷新数据，防止读取缓存
-            if not room.player_black and not room.player_white:
-                room.delete()
-                logger.info(f"房间 {self.room_id} 已经空无一人，物理删除成功。")
-            else:
-                # 只要还有一个人在，保持房间活跃状态
-                room.is_active = True
-                room.save()
-                
-        except GameRoom.DoesNotExist:
-            # 如果房间已经被另一方退出时删除了，则忽略报错
+            # 如果两个人都走了，或者房间空了，删除房间记录
+            if not r.player_black and not r.player_white:
+                r.delete()
+        except:
             pass
-        except Exception as e:
-            logger.error(f"清理房间数据库时发生异常: {e}")
