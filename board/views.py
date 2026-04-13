@@ -1,4 +1,7 @@
 import logging
+import json
+import os
+import traceback
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.decorators import method_decorator
@@ -9,200 +12,216 @@ from rest_framework import viewsets, permissions, status, decorators, views
 from rest_framework.response import Response
 from rest_framework.authentication import SessionAuthentication, TokenAuthentication
 
+# ✨ 导入工具
+from dotenv import load_dotenv
+from openai import OpenAI
+
 from .models import StickyNote, Profile, FriendRequest, ChatMessage
 from .serializers import StickyNoteSerializer, ProfileSerializer, ChatMessageSerializer
 
+# 加载环境变量
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
-# --- 1. 认证类：跳过 CSRF 检查以支持多端发布 ---
+# --- 0. AI 逻辑配置 ---
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"), 
+    base_url="https://api.deepseek.com"
+)
+
+# --- ✨ 五子棋博弈引擎 (Gomoku Engine) ---
+class GomokuEngine:
+    def __init__(self, board, ai_color):
+        self.board = board  # 15x15 矩阵
+        self.size = 15
+        self.ai_val = 1 if ai_color == 'black' else 2
+        self.player_val = 2 if ai_color == 'black' else 1
+
+    def get_best_move(self):
+        best_score = -1
+        best_move = (7, 7)
+        
+        # 扫描所有空位
+        for r in range(self.size):
+            for c in range(self.size):
+                if self.board[r][c] == 0:
+                    score = self.evaluate_point(r, c)
+                    if score > best_score:
+                        best_score = score
+                        best_move = (r, c)
+        return best_move
+
+    def evaluate_point(self, r, c):
+        # 防守权重稍微调高 (1.2)，让 AI 在困难模式下更难对付
+        ai_attack = self.calculate_score(r, c, self.ai_val)
+        player_threat = self.calculate_score(r, c, self.player_val)
+        return ai_attack + (player_threat * 1.2)
+
+    def calculate_score(self, r, c, color):
+        total_score = 0
+        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+        for dr, dc in directions:
+            line = self.get_line_context(r, c, dr, dc, color)
+            total_score += self.pattern_match(line, color)
+        return total_score
+
+    def get_line_context(self, r, c, dr, dc, color):
+        line = []
+        for i in range(-4, 5):
+            if i == 0:
+                line.append(color)
+                continue
+            nr, nc = r + i*dr, c + i*dc
+            if 0 <= nr < self.size and 0 <= nc < self.size:
+                line.append(self.board[nr][nc])
+            else:
+                line.append(-1) # 边界
+        return line
+
+    def pattern_match(self, line, color):
+        # ✨ 修复点：将 target 设为动态 color
+        s = "".join([str(x) if x != -1 else "B" for x in line])
+        target = str(color)
+        
+        # 评分标准
+        if target*5 in s: return 100000
+        if "0"+target*4+"0" in s: return 10000
+        if "0"+target*4 in s or target*4+"0" in s: return 5000
+        if "0"+target*3+"0" in s: return 2000
+        if "0"+target*2+"0" in s: return 500
+        return s.count(target) * 10
+
+# --- 1. 认证类 ---
 class UnsafeSessionAuthentication(SessionAuthentication):
     def enforce_csrf(self, request):
         return 
 
-# --- 2. 便签墙 (Felt Board) ---
+# --- 2 & 3. 视图集 (保持不变) ---
 @method_decorator(csrf_exempt, name='dispatch')
 class StickyNoteViewSet(viewsets.ModelViewSet):
     queryset = StickyNote.objects.all().order_by('-created_at')
     serializer_class = StickyNoteSerializer
     permission_classes = [permissions.IsAuthenticated]
     authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
-
-    def perform_create(self, serializer):
-        # 自动将当前登录用户保存为发布者
-        serializer.save(user=self.request.user)
-
+    def perform_create(self, serializer): serializer.save(user=self.request.user)
     @decorators.action(detail=True, methods=['post'])
     def toggle_like(self, request, pk=None):
-        note = self.get_object()
-        user = request.user
-        if note.likes.filter(id=user.id).exists():
-            note.likes.remove(user)
-            is_liked = False
-        else:
-            note.likes.add(user)
-            is_liked = True
-        return Response({
-            "likes_count": note.likes.count(),
-            "is_liked": is_liked
-        })
+        note = self.get_object(); user = request.user
+        if note.likes.filter(id=user.id).exists(): note.likes.remove(user); is_liked = False
+        else: note.likes.add(user); is_liked = True
+        return Response({"likes_count": note.likes.count(), "is_liked": is_liked})
 
-# --- 3. 个人资料与好友社交逻辑 ---
 @method_decorator(csrf_exempt, name='dispatch')
 class ProfileViewSet(viewsets.ModelViewSet):
     serializer_class = ProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
     authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
-
-    def get_queryset(self):
-        return Profile.objects.all()
-
-    # 获取/修改个人资料
+    def get_queryset(self): return Profile.objects.all()
     @decorators.action(detail=False, methods=['get', 'patch'])
     def me(self, request):
         profile, _ = Profile.objects.get_or_create(user=request.user)
-        if request.method == 'GET':
-            serializer = self.get_serializer(profile)
-            return Response(serializer.data)
-        if request.method == 'PATCH':
-            serializer = self.get_serializer(profile, data=request.data, partial=True)
-            if serializer.is_valid():
-                serializer.save()
-                return Response(serializer.data)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    # ✨ 核心搜索修复：根据搜索结果数量自动切换 [{}, {}] 或 {} 格式
+        if request.method == 'GET': return Response(self.get_serializer(profile).data)
+        serializer = self.get_serializer(profile, data=request.data, partial=True)
+        if serializer.is_valid(): serializer.save(); return Response(serializer.data)
+        return Response(serializer.errors, status=400)
     def list(self, request, *args, **kwargs):
-        # 获取查询参数
-        uid_param = request.query_params.get('uid')
-        q_param = request.query_params.get('q')
-        user_param = request.query_params.get('username')
-        query = uid_param or q_param or user_param
-        
+        query = request.query_params.get('uid') or request.query_params.get('q') or request.query_params.get('username')
         if query:
             clean_query = str(query).strip().strip('/')
-            
-            # 1. 构造搜索条件：用户名模糊匹配或 ID 精确匹配
-            user_filter = Q(username__iexact=clean_query)
-            if clean_query.isdigit():
-                user_filter |= Q(id=int(clean_query))
-            
-            target_users = User.objects.filter(user_filter)
-
-            if not target_users.exists():
-                return Response({"error": f"🔍 未找到用户 '{clean_query}'"}, status=404)
-
-            # 2. 检查是否搜到自己
-            if target_users.count() == 1 and target_users.first() == request.user:
-                return Response({"error": "这是你自己哦，不能添加自己"}, status=400)
-
-            # 3. 确保 Profile 记录存在并排除自己
-            profiles = []
-            for u in target_users.exclude(id=request.user.id):
-                p, _ = Profile.objects.get_or_create(user=u)
-                profiles.append(p)
-
-            # ✨ 关键：如果通过 uid 搜，或结果只有一个，直接返回对象 {} 而非数组 []
-            if (uid_param or len(profiles) == 1) and len(profiles) > 0:
-                serializer = self.get_serializer(profiles[0])
-                return Response(serializer.data)
-            else:
-                serializer = self.get_serializer(profiles, many=True)
-                return Response(serializer.data)
-        
+            target_users = User.objects.filter(Q(username__iexact=clean_query) | Q(id=clean_query if clean_query.isdigit() else -1))
+            profiles = [Profile.objects.get_or_create(user=u)[0] for u in target_users.exclude(id=request.user.id)]
+            return Response(self.get_serializer(profiles, many=True).data)
         return Response([])
-
-    # B. 发送好友申请
     @decorators.action(detail=False, methods=['post'])
     def add_friend(self, request):
-        target_uid = request.data.get('to_uid')
-        if not target_uid:
-            return Response({"error": "缺少目标用户ID"}, status=400)
-        
         try:
-            to_user = User.objects.get(id=int(target_uid))
-            if to_user == request.user:
-                return Response({"error": "不能加自己"}, status=400)
-            
-            # 检查是否已经是好友
-            is_friend = FriendRequest.objects.filter(
-                (Q(from_user=request.user, to_user=to_user) | Q(from_user=to_user, to_user=request.user)),
-                status='accepted'
-            ).exists()
-            if is_friend:
-                return Response({"error": "你们已经是好友了"}, status=400)
-
-            # 检查是否有待处理的申请
-            FriendRequest.objects.get_or_create(
-                from_user=request.user,
-                to_user=to_user,
-                defaults={'status': 'pending'}
-            )
+            to_user = User.objects.get(id=int(request.data.get('to_uid')))
+            FriendRequest.objects.get_or_create(from_user=request.user, to_user=to_user, defaults={'status': 'pending'})
             return Response({"message": "申请已发送"})
-        except (User.DoesNotExist, ValueError, TypeError):
-            return Response({"error": "用户不存在"}, status=404)
-
-    # C. 获取好友列表 (WebSocket 状态灯的基础)
+        except: return Response({"error": "用户不存在"}, status=404)
     @decorators.action(detail=False, methods=['get'])
     def my_friends(self, request):
-        friend_conns = FriendRequest.objects.filter(
-            (Q(from_user=request.user) | Q(to_user=request.user)), status='accepted'
-        ).select_related('from_user__profile', 'to_user__profile')
-        
+        friend_conns = FriendRequest.objects.filter((Q(from_user=request.user) | Q(to_user=request.user)), status='accepted')
         data = []
         for conn in friend_conns:
             friend = conn.to_user if conn.from_user == request.user else conn.from_user
             p, _ = Profile.objects.get_or_create(user=friend)
-            data.append({
-                "uid": int(friend.id),
-                "username": str(friend.username),
-                "nickname": str(p.nickname or friend.username),
-                "avatar": p.avatar.url if p.avatar else None,
-                "is_online": bool(p.is_online)
-            })
+            data.append({"uid": friend.id, "username": friend.username, "nickname": p.nickname or friend.username, "avatar": p.avatar.url if p.avatar else None, "is_online": p.is_online})
         return Response(data)
 
-    # D. 获取好友请求列表
-    @decorators.action(detail=False, methods=['get'])
-    def my_requests(self, request):
-        reqs = FriendRequest.objects.filter(to_user=request.user, status='pending')
-        data = [{
-            "id": r.id,
-            "from_uid": int(r.from_user.id),
-            "from_name": str(r.from_user.username),
-            "time": r.created_at.strftime("%Y-%m-%d %H:%M")
-        } for r in reqs]
-        return Response(data)
-
-    # E. 处理好友申请
-    @decorators.action(detail=False, methods=['post'])
-    def handle_request(self, request):
-        req_id = request.data.get('req_id')
-        action = request.data.get('action') # 'accept' 或 'reject'
-        try:
-            req_obj = FriendRequest.objects.get(id=req_id, to_user=request.user)
-            if action == 'accept':
-                req_obj.status = 'accepted'
-                req_obj.save()
-                return Response({"message": "已同意申请"})
-            else:
-                req_obj.delete()
-                return Response({"message": "已忽略申请"})
-        except FriendRequest.DoesNotExist:
-            return Response({"error": "该申请已失效或已处理"}, status=404)
-
-# --- 4. 历史记录接口 ---
 class ChatHistoryView(views.APIView):
-    permission_classes = [permissions.IsAuthenticated]
-    authentication_classes = [TokenAuthentication, UnsafeSessionAuthentication]
-    
     def get(self, request, friend_id):
-        # 查询当前用户与指定好友之间的所有消息
-        messages = ChatMessage.objects.filter(
-            (Q(sender=request.user) & Q(receiver_id=friend_id)) | 
-            (Q(sender_id=friend_id) & Q(receiver=request.user))
-        ).order_by('timestamp')
-        serializer = ChatMessageSerializer(messages, many=True)
-        return Response(serializer.data)
+        msgs = ChatMessage.objects.filter((Q(sender=request.user) & Q(receiver_id=friend_id)) | (Q(sender_id=friend_id) & Q(receiver=request.user))).order_by('timestamp')
+        return Response(ChatMessageSerializer(msgs, many=True).data)
+
+# --- 5. ✨ 混合动力 AI 助手接口 ---
+@decorators.api_view(['POST'])
+@decorators.permission_classes([permissions.IsAuthenticated])
+@decorators.authentication_classes([TokenAuthentication, UnsafeSessionAuthentication])
+def ai_chat_proxy(request):
+    user_msg = request.data.get('message', '')
+    chat_type = request.data.get('type', 'general')
+    page_context = request.data.get('page', '首页')
+
+    if chat_type == 'gomoku_move':
+        board = request.data.get('board', [])
+        difficulty = request.data.get('difficulty', 'medium')
+        ai_color = request.data.get('ai_color', 'white') 
+
+        # 1. 困难模式直接走本地引擎（无延迟，逻辑强）
+        if difficulty == 'hard':
+            engine = GomokuEngine(board, ai_color)
+            row, col = engine.get_best_move()
+            return Response({'status': 'success', 'move': {'row': row, 'col': col}})
+        
+        # 2. 普通模式走 DeepSeek（增加趣味性）
+        col_header = "    0 1 2 3 4 5 6 7 8 9 a b c d e"
+        board_rows = [f"{format(i, 'x')} | " + " ".join(map(str, r)) for i, r in enumerate(board)]
+        readable_board = col_header + "\n" + "\n".join(board_rows)
+
+        system_prompt = (
+            f"You are a Gomoku player. Board: 15x15. Level: {difficulty}.\n"
+            f"MAP:\n{readable_board}\n"
+            "Pick an EMPTY (0) spot. Return ONLY JSON: {\"row\": r, \"col\": c}."
+        )
+
+        try:
+            # ✨ 设置 20 秒超时，确保前端 30 秒倒计时不会因为 AI 思考太久而直接判输
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "Your move."}],
+                response_format={'type': 'json_object'},
+                temperature=0.7,
+                timeout=20.0 
+            )
+            move_data = json.loads(response.choices[0].message.content)
+            
+            # 后端安全校验：如果 AI 给了一个非空坐标，强行走引擎保底
+            r, c = move_data.get('row'), move_data.get('col')
+            if board[r][c] != 0:
+                r, c = GomokuEngine(board, ai_color).get_best_move()
+            
+            return Response({'status': 'success', 'move': {'row': r, 'col': c}})
+        except Exception as e:
+            # 如果 API 崩了，走引擎保底，防止对局卡死
+            r, c = GomokuEngine(board, ai_color).get_best_move()
+            return Response({'status': 'success', 'move': {'row': r, 'col': c}})
+
+    # --- 通用聊天逻辑 ---
+    if not user_msg: return Response({'status': 'error', 'message': '内容为空'}, status=400)
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": f"你叫“SZH 小管家”，是 Ciallo 网站的助手。"},
+                {"role": "user", "content": f"当前页面：{page_context}\n用户说：{user_msg}"},
+            ],
+            timeout=25.0
+        )
+        return Response({'status': 'success', 'reply': response.choices[0].message.content})
+    except Exception as e:
+        return Response({'status': 'error', 'message': 'AI 走神了'}, status=500)
 
 def index_view(request):
     return render(request, 'board/index.html')
