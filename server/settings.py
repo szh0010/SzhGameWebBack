@@ -7,16 +7,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # 自动寻找根目录下的 .env 文件并加载
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 
-# --- 1. 基础路径与密钥 (从环境变量读取) ---
-# 如果 .env 里没写，这里会报错，这是一种安全保护
+# --- 1. 基础路径与密钥 ---
 SECRET_KEY = os.getenv('SECRET_KEY')
 
-# 注意：环境变量读取的是字符串 "True"/"False"
-DEBUG = os.getenv('DEBUG', 'False') == 'True'
+# ✨ 核心修改 1：强制开启 DEBUG 模式！
+# 这样本地开发时，Django 才会帮你代理显示 /media/ 里的图片
+DEBUG = True
 
-# 部署后，请把你的服务器 IP 加到这个列表里
-# 例如：ALLOWED_HOSTS = ['123.45.67.89', 'localhost', '127.0.0.1']
-ALLOWED_HOSTS = ['*']
+# ✨ 核心修改 2：加入你的公网 IP，确保服务器能识别请求
+ALLOWED_HOSTS = ['47.98.240.67', '127.0.0.1', 'localhost', '*']
 
 
 # --- 2. 应用定义 (顺序至关重要) ---
@@ -127,17 +126,19 @@ REST_FRAMEWORK = {
 # --- 11. 核心跨域与安全配置 ---
 CORS_ALLOW_CREDENTIALS = True 
 
-# 允许跨域的白名单
+# ✨ 核心修改 3：允许跨域的白名单（加入了公网 IP）
 CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://47.98.240.67",
 ]
 
-# CSRF 信任名单（包含本地和未来的生产域名）
+# ✨ 核心修改 4：CSRF 信任名单（加入了公网 IP）
 CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://127.0.0.1:8000",
+    "http://47.98.240.67",
 ]
 
 # Cookie 与 Session 安全策略

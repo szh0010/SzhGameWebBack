@@ -27,7 +27,7 @@ urlpatterns = [
 ]
 
 # ✨ 核心：配置媒体文件访问（头像、便签图片等）
+# 当 DEBUG = True 时，Django 会接管这些静态/媒体文件的代理
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    # 如果你也想在开发环境下访问静态文件
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
